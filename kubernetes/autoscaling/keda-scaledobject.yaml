@@ -1,0 +1,162 @@
+###############################################################
+# kubernetes/autoscaling/keda-scaledobject.yaml
+# KEDA event-driven autoscaling for Service Bus consumers
+#
+# Architecture decision: KEDA was introduced after the DLQ incident
+# (INC-2024-112) where 4,847 transactions silently queued for 6 days
+# because HPA CPU-based scaling did not respond to queue backlog.
+# KEDA scales based on Service Bus queue depth — no queue depth goes
+# unnoticed for more than one polling interval (30s).
+###############################################################
+
+###############################################################
+# Payment Service — scales 3→20 with Service Bus queue depth
+###############################################################
+apiVersion: keda.sh/v1alpha1
+kind: ScaledObject
+metadata:
+  name: payment-service-scaledobject
+  namespace: banking
+  labels:
+    app.kubernetes.io/name: payment-service
+    app.kubernetes.io/component: autoscaling
+spec:
+  scaleTargetRef:
+    apiVersion: apps/v1
+    kind: Deployment
+    name: payment-service
+
+  # Polling interval: how frequently KEDA checks the scaler
+  pollingInterval: 15    # 15s — fast response to payment spikes
+
+  # Cooldown: minimum time before scaling down after a scale event
+  cooldownPeriod: 300    # 5 minutes — prevents flapping during batch processing
+
+  # Minimum replicas (0 not permitted — payment service must always be available)
+  minReplicaCount: 3
+  maxReplicaCount: 20
+
+  # Fallback: if external scaler is unreachable, maintain current replicas
+  fallback:
+    failureThreshold: 3
+    replicas: 5
+
+  advanced:
+    restoreToOriginalReplicaCount: false
+    horizontalPodAutoscalerConfig:
+      behavior:
+        scaleDown:
+          stabilizationWindowSeconds: 300
+          policies:
+            - type: Pods
+              value: 1
+              periodSeconds: 60
+        scaleUp:
+          stabilizationWindowSeconds: 0   # Immediate scale-up for payment spikes
+          policies:
+            - type: Pods
+              value: 3
+              periodSeconds: 30
+
+  triggers:
+    # Primary trigger: Azure Service Bus queue depth
+    - type: azure-servicebus
+      metadata:
+        namespace: sb-pwc-banking-prod.servicebus.windows.net
+        queueName: payment-instructions
+        messageCount: "5"    # Scale out when > 5 messages per replica
+        activationMessageCount: "1"
+        connectionFromEnv: SERVICE_BUS_NAMESPACE
+      authenticationRef:
+        name: keda-servicebus-auth
+        kind: TriggerAuthentication
+
+    # Secondary trigger: CPU utilization (maintain HPA behaviour as fallback)
+    - type: cpu
+      metadata:
+        type: Utilization
+        value: "70"
+
+---
+###############################################################
+# Notification Service — scales 0→15 with queue depth
+# Can scale to zero when no notifications are pending (cost saving)
+###############################################################
+apiVersion: keda.sh/v1alpha1
+kind: ScaledObject
+metadata:
+  name: notification-service-scaledobject
+  namespace: banking
+  labels:
+    app.kubernetes.io/name: notification-service
+    app.kubernetes.io/component: autoscaling
+spec:
+  scaleTargetRef:
+    apiVersion: apps/v1
+    kind: Deployment
+    name: notification-service
+
+  pollingInterval: 30
+  cooldownPeriod: 120
+
+  minReplicaCount: 0    # Scale to zero during off-hours (cost optimisation)
+  maxReplicaCount: 15
+
+  fallback:
+    failureThreshold: 5
+    replicas: 2
+
+  advanced:
+    restoreToOriginalReplicaCount: true
+    horizontalPodAutoscalerConfig:
+      behavior:
+        scaleDown:
+          stabilizationWindowSeconds: 60
+          policies:
+            - type: Pods
+              value: 2
+              periodSeconds: 60
+        scaleUp:
+          stabilizationWindowSeconds: 0
+          policies:
+            - type: Pods
+              value: 5
+              periodSeconds: 30
+
+  triggers:
+    - type: azure-servicebus
+      metadata:
+        namespace: sb-pwc-banking-prod.servicebus.windows.net
+        queueName: payment-notifications
+        messageCount: "10"
+        activationMessageCount: "1"
+      authenticationRef:
+        name: keda-servicebus-auth
+        kind: TriggerAuthentication
+
+---
+###############################################################
+# TriggerAuthentication — uses Workload Identity Federation
+# No connection strings in Kubernetes Secrets
+###############################################################
+apiVersion: keda.sh/v1alpha1
+kind: TriggerAuthentication
+metadata:
+  name: keda-servicebus-auth
+  namespace: banking
+spec:
+  podIdentity:
+    provider: azure-workload
+    identityId: "KEDA_IDENTITY_CLIENT_ID"
+
+---
+###############################################################
+# Cluster-scoped KEDA operator configuration
+###############################################################
+apiVersion: keda.sh/v1alpha1
+kind: ClusterTriggerAuthentication
+metadata:
+  name: keda-azure-auth
+spec:
+  podIdentity:
+    provider: azure-workload
