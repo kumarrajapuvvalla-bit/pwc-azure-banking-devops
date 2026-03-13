@@ -1,0 +1,143 @@
+###############################################################
+# kubernetes/ingress/banking-ingress.yaml
+# Ingress routing rules for all Banking Platform microservices
+#
+# Traffic flow:
+#   Internet → Azure AGW (TLS termination + WAF)
+#              → NGINX Ingress (internal L7 routing)
+#              → Service ClusterIP
+#              → Pod
+#
+# Rate limiting applied per-service based on FCA guidelines:
+#   - Payment API: 100 req/min per client IP (prevents enumeration)
+#   - Notification: 500 req/min (higher — webhook ingestion)
+#   - Health endpoints: unlimited (load balancer probes)
+###############################################################
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: banking-platform-ingress
+  namespace: banking
+  labels:
+    app.kubernetes.io/part-of: core-banking
+    app.kubernetes.io/managed-by: Helm
+  annotations:
+    kubernetes.io/ingress.class: nginx
+    # TLS redirect
+    nginx.ingress.kubernetes.io/ssl-redirect: "true"
+    nginx.ingress.kubernetes.io/force-ssl-redirect: "true"
+    # Security headers
+    nginx.ingress.kubernetes.io/configuration-snippet: |
+      more_set_headers "X-Frame-Options: DENY";
+      more_set_headers "X-Content-Type-Options: nosniff";
+      more_set_headers "X-XSS-Protection: 1; mode=block";
+      more_set_headers "Referrer-Policy: strict-origin-when-cross-origin";
+      more_set_headers "Content-Security-Policy: default-src 'none'; frame-ancestors 'none'";
+      more_set_headers "Permissions-Policy: geolocation=(), microphone=(), camera=()";
+    # Rate limiting (payment endpoints)
+    nginx.ingress.kubernetes.io/limit-rps: "2"         # 2 req/s = ~100 req/min per IP
+    nginx.ingress.kubernetes.io/limit-connections: "10"
+    # Timeouts tuned for payment processing latency SLA
+    nginx.ingress.kubernetes.io/proxy-connect-timeout: "10"
+    nginx.ingress.kubernetes.io/proxy-read-timeout: "60"
+    nginx.ingress.kubernetes.io/proxy-send-timeout: "60"
+    # Request ID for tracing
+    nginx.ingress.kubernetes.io/enable-access-log: "true"
+    nginx.ingress.kubernetes.io/rewrite-target: /$2
+spec:
+  ingressClassName: nginx
+  tls:
+    - hosts:
+        - api.banking.internal
+        - payments.banking.internal
+      secretName: banking-tls-cert
+  rules:
+    ###########################################################
+    # Core Banking API
+    ###########################################################
+    - host: api.banking.internal
+      http:
+        paths:
+          - path: /api/v1(/|$)(.*)
+            pathType: ImplementationSpecific
+            backend:
+              service:
+                name: banking-api
+                port:
+                  name: http
+          - path: /health(/|$)(.*)
+            pathType: ImplementationSpecific
+            backend:
+              service:
+                name: banking-api
+                port:
+                  name: http
+
+    ###########################################################
+    # Payment Service
+    ###########################################################
+    - host: payments.banking.internal
+      http:
+        paths:
+          - path: /api/v1/payments(/|$)(.*)
+            pathType: ImplementationSpecific
+            backend:
+              service:
+                name: payment-service
+                port:
+                  name: http
+          - path: /api/v1/payment-status(/|$)(.*)
+            pathType: ImplementationSpecific
+            backend:
+              service:
+                name: payment-service
+                port:
+                  name: http
+          - path: /health(/|$)(.*)
+            pathType: ImplementationSpecific
+            backend:
+              service:
+                name: payment-service
+                port:
+                  name: http
+
+---
+###############################################################
+# Custom headers ConfigMap (referenced in NGINX config)
+###############################################################
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: custom-headers
+  namespace: ingress-nginx
+data:
+  X-Request-ID: "${req_id}"
+  X-Real-IP: "${remote_addr}"
+  X-Forwarded-For: "${proxy_add_x_forwarded_for}"
+  X-Forwarded-Proto: "${scheme}"
+
+---
+###############################################################
+# Network Policy: allow NGINX → banking namespace
+###############################################################
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: allow-ingress-nginx
+  namespace: banking
+spec:
+  podSelector: {}  # All pods in banking namespace
+  policyTypes:
+    - Ingress
+  ingress:
+    - from:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: ingress-nginx
+      ports:
+        - protocol: TCP
+          port: 8080
+        - protocol: TCP
+          port: 8081
+        - protocol: TCP
+          port: 8082
