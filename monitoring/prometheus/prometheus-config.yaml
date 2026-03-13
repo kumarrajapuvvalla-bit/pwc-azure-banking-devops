@@ -1,0 +1,214 @@
+###############################################################
+# monitoring/prometheus/prometheus-config.yaml
+# Prometheus configuration for PwC Azure Banking Platform
+# FCA requirement: P0 alert MTTA <= 4 minutes
+###############################################################
+apiVersion: monitoring.coreos.com/v1
+kind: Prometheus
+metadata:
+  name: banking-prometheus
+  namespace: monitoring
+  labels:
+    app.kubernetes.io/name: prometheus
+    app.kubernetes.io/part-of: banking-observability
+spec:
+  replicas: 2
+  version: v2.48.0
+  retention: 30d
+  retentionSize: 50GB
+
+  serviceAccountName: prometheus
+
+  serviceMonitorSelector:
+    matchLabels:
+      release: prometheus-stack
+
+  podMonitorSelector:
+    matchLabels:
+      release: prometheus-stack
+
+  ruleSelector:
+    matchLabels:
+      release: prometheus-stack
+
+  storage:
+    volumeClaimTemplate:
+      spec:
+        storageClassName: managed-premium
+        accessModes: [ReadWriteOnce]
+        resources:
+          requests:
+            storage: 100Gi
+
+  resources:
+    requests:
+      cpu: 500m
+      memory: 2Gi
+    limits:
+      cpu: 2000m
+      memory: 8Gi
+
+  securityContext:
+    runAsUser: 65534
+    runAsNonRoot: true
+    fsGroup: 65534
+
+  additionalScrapeConfigs:
+    name: additional-scrape-configs
+    key: prometheus-additional.yaml
+
+  alerting:
+    alertmanagers:
+      - namespace: monitoring
+        name: alertmanager-main
+        port: web
+
+  externalLabels:
+    cluster: aks-pwc-banking-prod-uks
+    environment: production
+    region: uksouth
+
+---
+apiVersion: monitoring.coreos.com/v1
+kind: ServiceMonitor
+metadata:
+  name: banking-api-monitor
+  namespace: monitoring
+  labels:
+    app.kubernetes.io/name: banking-api
+    release: prometheus-stack
+spec:
+  namespaceSelector:
+    matchNames: [banking]
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: banking-api
+  endpoints:
+    - port: metrics
+      interval: 15s
+      path: /metrics
+      scrapeTimeout: 10s
+      relabelings:
+        - sourceLabels: [__meta_kubernetes_pod_label_app_kubernetes_io_version]
+          targetLabel: app_version
+        - sourceLabels: [__meta_kubernetes_namespace]
+          targetLabel: namespace
+
+---
+apiVersion: monitoring.coreos.com/v1
+kind: PrometheusRule
+metadata:
+  name: banking-api-alerts
+  namespace: monitoring
+  labels:
+    app.kubernetes.io/name: banking-api
+    release: prometheus-stack
+spec:
+  groups:
+    - name: banking-api.critical
+      interval: 30s
+      rules:
+        # P0: Payment transaction error rate (FCA reportable threshold)
+        - alert: PaymentTransactionErrorRateCritical
+          expr: |
+            (
+              rate(banking_transactions_total{status="error",type="payment"}[5m])
+              /
+              rate(banking_transactions_total{type="payment"}[5m])
+            ) > 0.01
+          for: 2m
+          labels:
+            severity: critical
+            team: platform-engineering
+            fca_reportable: "true"
+            runbook: https://wiki.internal/runbooks/payment-error-rate
+          annotations:
+            summary: Payment transaction error rate above 1% SLA threshold
+            description: |
+              Payment error rate is {{ humanizePercentage $value }} over last 5m.
+              FCA P0 threshold: 30-minute resolution required.
+
+        # P0: API response time exceeding SLA
+        - alert: APILatencyP99Critical
+          expr: |
+            histogram_quantile(0.99,
+              rate(http_request_duration_seconds_bucket{
+                job="banking-api",
+                path=~"/api/v1/payments.*"
+              }[5m])
+            ) > 3.0
+          for: 5m
+          labels:
+            severity: critical
+            team: platform-engineering
+            runbook: https://wiki.internal/runbooks/api-latency
+          annotations:
+            summary: Banking API P99 latency exceeds 3 second SLA
+            description: P99 latency is {{ humanizeDuration $value }} for payment endpoints.
+
+        # P0: Pod availability below PDB threshold
+        - alert: BankingAPIPodAvailabilityCritical
+          expr: |
+            kube_deployment_status_replicas_available{
+              namespace="banking",
+              deployment="banking-api"
+            } < 3
+          for: 1m
+          labels:
+            severity: critical
+            team: platform-engineering
+            runbook: https://wiki.internal/runbooks/pod-availability
+          annotations:
+            summary: Banking API has fewer than 3 available pods
+            description: Only {{ $value }} pod(s) available. Minimum required for HA is 3.
+
+    - name: banking-api.warnings
+      interval: 60s
+      rules:
+        # P1: Dead Letter Queue accumulation
+        - alert: DLQMessagesAccumulating
+          expr: |
+            azure_servicebus_deadlettered_messages_count{
+              namespace="pwc-banking",
+              queue=~"payment.*"
+            } > 10
+          for: 10m
+          labels:
+            severity: warning
+            team: platform-engineering
+            runbook: https://wiki.internal/runbooks/dlq-monitoring
+          annotations:
+            summary: Dead Letter Queue accumulating payment messages
+            description: |
+              DLQ has {{ $value }} messages for queue {{ $labels.queue }}.
+              Investigate schema validation failures.
+
+        # P1: Memory pressure
+        - alert: BankingAPIPodMemoryHigh
+          expr: |
+            container_memory_working_set_bytes{
+              namespace="banking",
+              container="banking-api"
+            } / container_spec_memory_limit_bytes{
+              namespace="banking",
+              container="banking-api"
+            } > 0.85
+          for: 5m
+          labels:
+            severity: warning
+            team: platform-engineering
+          annotations:
+            summary: Banking API container memory utilization above 85%
+            description: Memory utilization is {{ humanizePercentage $value }}.
+
+        # P2: Certificate expiry warning
+        - alert: TLSCertificateExpiringSoon
+          expr: |
+            (ssl_certificate_expiry_seconds - time()) / 86400 < 30
+          for: 1h
+          labels:
+            severity: warning
+            team: platform-engineering
+          annotations:
+            summary: TLS certificate expiring in less than 30 days
+            description: Certificate {{ $labels.cn }} expires in {{ $value | int }} days.
