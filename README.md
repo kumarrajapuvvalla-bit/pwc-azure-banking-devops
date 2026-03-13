@@ -4,7 +4,7 @@
 [![Terraform](https://img.shields.io/badge/Terraform-1.5.7-623CE4?logo=terraform)](https://terraform.io)
 [![AKS](https://img.shields.io/badge/AKS-1.28-326CE5?logo=kubernetes)](https://azure.microsoft.com/en-gb/products/kubernetes-service)
 [![Compliance](https://img.shields.io/badge/Compliance-FCA%20%7C%20PCI--DSS%20%7C%20ISO27001-red)](https://www.fca.org.uk)
-
+h
 > **Role:** Azure DevOps Engineer · PwC UK · Full-Time Embedded Engagement (1 Year 7 Months)  
 > **Domain:** UK Major Retail Bank — Core Banking Cloud Transformation  
 > **Disclaimer:** Personal portfolio project. All code rebuilt from engineering knowledge as open-source reference. No PwC methodology, client IP, or confidential banking data included.
@@ -204,7 +204,7 @@ Alerts route through Prometheus Alertmanager → PagerDuty. The alert configurat
 
 ### Grafana Dashboards
 
-Dashboards are stored as JSON in `monitoring/grafana/dashboards/` and provisioned automatically via ConfigMap in the monitoring namespace.
+Dashboards are stored as JSON in `monitoring/prometheus/` and `monitoring/alertmanager/` and provisioned automatically via ConfigMap in the monitoring namespace.ConfigMap in the monitoring namespace.
 
 - **Banking API Overview** — SLA tracking, P99 latency, payment error rate, pod availability
 - **Infrastructure Overview** — Node resource utilization, cluster capacity, AKS events
@@ -233,8 +233,9 @@ Dashboards are stored as JSON in `monitoring/grafana/dashboards/` and provisione
 ├── .github/
 │   └── workflows/
 │       ├── ci-pipeline.yml        # Build, lint, test, scan
-│       ├── cd-pipeline.yml        # Deploy to staging → prod
+│   │   ├── container-build-push.yml  # Container build, Trivy scan, push to ACR
 │       └── terraform-apply.yml    # Infrastructure provisioning
+│   │   └── secret-rotation.yml       # ISO 27001 90-day scheduled secret rotation
 ├── terraform/
 │   ├── main.tf                    # Root configuration
 │   ├── variables.tf               # Input variables
